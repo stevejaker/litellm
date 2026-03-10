@@ -1,6 +1,6 @@
 """
 Unit tests for Snowflake chat transformation
-Tests tool calling request/response transformations
+Tests tool calling request/response transformations and streaming
 """
 
 import os
@@ -13,8 +13,11 @@ from unittest.mock import MagicMock
 import httpx
 
 import litellm
-from litellm.llms.snowflake.chat.transformation import SnowflakeConfig
-from litellm.types.utils import ModelResponse
+from litellm.llms.snowflake.chat.transformation import (
+    SnowflakeConfig,
+    SnowflakeStreamingHandler,
+)
+from litellm.types.utils import ModelResponse, ModelResponseStream
 
 
 class TestSnowflakeToolTransformation:
@@ -106,9 +109,7 @@ class TestSnowflakeToolTransformation:
     def test_transform_request_with_string_tool_choice(self):
         """
         Test that string tool_choice values are transformed to Snowflake object format.
-
-        Snowflake requires tool_choice to be an object, not a string.
-        Ref: https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/reference/cortex-inference#post--api-v2-cortex-inference-complete-req-body-schema
+        Snowflake expects {"type": "auto"} not string "auto".
         """
         config = SnowflakeConfig()
 
@@ -123,7 +124,7 @@ class TestSnowflakeToolTransformation:
                 headers={},
             )
 
-            # Snowflake requires object format: {"type": "auto"} not string "auto"
+            # Snowflake expects object format: {"type": "auto"} not string "auto"
             assert transformed_request["tool_choice"] == {"type": value}
 
     def test_transform_response_with_tool_calls(self):
@@ -429,3 +430,295 @@ class TestSnowFlakeCompletion:
 
         os.environ.pop("SNOWFLAKE_ACCOUNT_ID", None)
         os.environ.pop("SNOWFLAKE_JWT", None)
+
+
+class TestSnowflakeStreamingHandler:
+    """Test suite for Snowflake streaming tool call handling
+
+    Snowflake streaming format uses choices[].delta with custom fields:
+    - Text: {"choices":[{"delta":{"type":"text","content":"..."}}]}
+    - Tool start: {"choices":[{"delta":{"type":"tool_use","tool_use_id":"...","name":"get_weather"}}]}
+    - Tool input: {"choices":[{"delta":{"type":"tool_use","input":"{\"location"}}]}
+    """
+
+    def test_streaming_handler_text_chunk(self):
+        """
+        Test that text content chunks are correctly parsed.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        # Simulate Snowflake text chunk
+        chunk = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "text",
+                        "content": "Hello, world!",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk)
+        assert isinstance(result, ModelResponseStream)
+        assert result.choices[0].delta.content == "Hello, world!"
+        assert result.choices[0].delta.tool_calls is None
+
+    def test_streaming_handler_tool_use_start(self):
+        """
+        Test that tool_use start chunks are correctly transformed to OpenAI format.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        # Simulate Snowflake tool_use start chunk
+        chunk = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "tool_use_id": "tooluse_abc123",
+                        "name": "get_weather",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk)
+
+        assert isinstance(result, ModelResponseStream)
+        assert result.choices[0].delta.tool_calls is not None
+        assert len(result.choices[0].delta.tool_calls) == 1
+
+        tool_call = result.choices[0].delta.tool_calls[0]
+        assert tool_call["id"] == "tooluse_abc123"
+        assert tool_call["type"] == "function"
+        assert tool_call["function"]["name"] == "get_weather"
+        assert tool_call["function"]["arguments"] == ""
+        assert tool_call["index"] == 0
+
+    def test_streaming_handler_tool_use_input_delta(self):
+        """
+        Test that tool_use input delta chunks are correctly parsed.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        # First, send tool_use start to initialize tool index
+        chunk_start = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "tool_use_id": "tooluse_abc123",
+                        "name": "get_weather",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        handler.chunk_parser(chunk_start)
+
+        # Now simulate input delta
+        chunk_delta = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "input": '{"location',
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk_delta)
+
+        assert result.choices[0].delta.tool_calls is not None
+        tool_call = result.choices[0].delta.tool_calls[0]
+        assert tool_call["function"]["arguments"] == '{"location'
+        assert tool_call["index"] == 0
+
+        # Another delta chunk
+        chunk_delta2 = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "input": '": "Paris"}',
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk_delta2)
+
+        tool_call = result.choices[0].delta.tool_calls[0]
+        assert tool_call["function"]["arguments"] == '": "Paris"}'
+
+    def test_streaming_handler_usage_extraction(self):
+        """
+        Test that usage info is correctly extracted from chunks.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        # Chunk with usage
+        chunk = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "text",
+                        "content": "",
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 377,
+                "completion_tokens": 64,
+                "total_tokens": 441,
+            },
+        }
+        result = handler.chunk_parser(chunk)
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 377
+        assert result.usage.completion_tokens == 64
+        assert result.usage.total_tokens == 441
+
+    def test_streaming_handler_multiple_tool_calls(self):
+        """
+        Test that multiple tool calls get sequential indices.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        # First tool
+        chunk1 = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "tool_use_id": "tooluse_first",
+                        "name": "get_weather",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result1 = handler.chunk_parser(chunk1)
+        assert result1.choices[0].delta.tool_calls[0]["index"] == 0
+
+        # Second tool
+        chunk2 = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "tool_use",
+                        "tool_use_id": "tooluse_second",
+                        "name": "get_time",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result2 = handler.chunk_parser(chunk2)
+        assert result2.choices[0].delta.tool_calls[0]["index"] == 1
+        assert result2.choices[0].delta.tool_calls[0]["id"] == "tooluse_second"
+
+    def test_streaming_handler_finish_reason(self):
+        """
+        Test that finish_reason is passed through correctly.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        chunk = {
+            "id": "msg-123",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "text",
+                        "content": "",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk)
+        assert result.choices[0].finish_reason == "stop"
+
+    def test_streaming_handler_preserves_response_metadata(self):
+        """
+        Test that response ID and model are preserved.
+        """
+        handler = SnowflakeStreamingHandler(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+
+        chunk = {
+            "id": "3b26d9f4-1e49-461a-a71a-1e89656a21a0",
+            "model": "claude-3-5-sonnet",
+            "choices": [
+                {
+                    "delta": {
+                        "type": "text",
+                        "content": "Hello",
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        result = handler.chunk_parser(chunk)
+
+        assert result.id == "3b26d9f4-1e49-461a-a71a-1e89656a21a0"
+        assert result.model == "claude-3-5-sonnet"
+
+    def test_get_model_response_iterator_returns_streaming_handler(self):
+        """
+        Test that SnowflakeConfig.get_model_response_iterator returns SnowflakeStreamingHandler.
+        """
+        config = SnowflakeConfig()
+        iterator = config.get_model_response_iterator(
+            streaming_response=iter([]),
+            sync_stream=True,
+            json_mode=False,
+        )
+        assert isinstance(iterator, SnowflakeStreamingHandler)

@@ -3,12 +3,36 @@ Support for Snowflake REST API
 """
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import httpx
 
-from litellm.types.llms.openai import AllMessageValues
-from litellm.types.utils import ChatCompletionMessageToolCall, Function, ModelResponse
+from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionToolCallChunk,
+    ChatCompletionToolCallFunctionChunk,
+)
+from litellm.types.utils import (
+    ChatCompletionMessageToolCall,
+    Delta,
+    Function,
+    ModelResponse,
+    ModelResponseStream,
+    StreamingChoices,
+    Usage,
+)
+from litellm.types.utils import _generate_id
 
 from ...openai_like.chat.transformation import OpenAIGPTConfig
 
@@ -212,9 +236,6 @@ class SnowflakeConfig(SnowflakeBaseConfig, OpenAIGPTConfig):
         """
         Transform OpenAI tool_choice format to Snowflake format.
 
-        Snowflake requires tool_choice to be an object, not a string.
-        Ref: https://docs.snowflake.com/en/developer-guide/snowflake-rest-api/reference/cortex-inference#post--api-v2-cortex-inference-complete-req-body-schema
-
         Args:
             tool_choice: Tool choice in OpenAI format (str or dict)
 
@@ -224,11 +245,11 @@ class SnowflakeConfig(SnowflakeBaseConfig, OpenAIGPTConfig):
         OpenAI format (string): "auto", "required", "none"
         OpenAI format (object): {"type": "function", "function": {"name": "get_weather"}}
 
-        Snowflake format (string values become objects): {"type": "auto"}
+        Snowflake format (string values): {"type": "auto"}, {"type": "required"}, {"type": "none"}
         Snowflake format (specific tool): {"type": "tool", "name": ["get_weather"]}
         """
         if isinstance(tool_choice, str):
-            # Snowflake requires object format: {"type": "auto"} not string "auto"
+            # Snowflake expects object format: {"type": "auto"} not string "auto"
             return {"type": tool_choice}
 
         if isinstance(tool_choice, dict):
@@ -259,7 +280,8 @@ class SnowflakeConfig(SnowflakeBaseConfig, OpenAIGPTConfig):
         if tools:
             optional_params["tools"] = self._transform_tools(tools)
 
-        # Transform tool_choice from OpenAI format to Snowflake's tool name array format
+        # Transform tool_choice from OpenAI format to Snowflake format
+        # Snowflake expects object format: {"type": "auto"} not string "auto"
         tool_choice = optional_params.pop("tool_choice", None)
         if tool_choice:
             optional_params["tool_choice"] = self._transform_tool_choice(tool_choice)
@@ -271,3 +293,154 @@ class SnowflakeConfig(SnowflakeBaseConfig, OpenAIGPTConfig):
             **optional_params,
             **extra_body,
         }
+
+    def get_model_response_iterator(
+        self,
+        streaming_response: Union[Iterator[str], AsyncIterator[str], ModelResponse],
+        sync_stream: bool,
+        json_mode: Optional[bool] = False,
+    ) -> Any:
+        """
+        Return a Snowflake-specific streaming handler that transforms
+        Snowflake's content_block streaming format to OpenAI-compatible format.
+
+        Snowflake uses Anthropic-style streaming with content_block_start/delta/stop
+        events for tool calls, which requires custom handling.
+        """
+        return SnowflakeStreamingHandler(
+            streaming_response=streaming_response,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
+
+
+class SnowflakeStreamingHandler(BaseModelResponseIterator):
+    """
+    Streaming handler for Snowflake Cortex LLM REST API.
+
+    Snowflake streaming format uses choices[].delta but with custom fields for tool calls:
+        - Text: {"choices":[{"delta":{"type":"text","content":"..."}}]}
+        - Tool start: {"choices":[{"delta":{"type":"tool_use","tool_use_id":"...","name":"get_weather"}}]}
+        - Tool input: {"choices":[{"delta":{"type":"tool_use","input":"{\"location"}}]}
+
+    This handler transforms these to OpenAI-compatible streaming format:
+        - {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "...", "function": {"name": "...", "arguments": "..."}}]}}]}
+    """
+
+    def __init__(
+        self,
+        streaming_response: Union[Iterator[str], AsyncIterator[str], ModelResponse],
+        sync_stream: bool,
+        json_mode: Optional[bool] = False,
+    ):
+        super().__init__(
+            streaming_response=streaming_response,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
+        # Track tool call index across chunks
+        self.tool_index = -1
+        # Track current tool_use_id to detect new tool calls
+        self.current_tool_use_id: Optional[str] = None
+        # Generate consistent response ID for the stream
+        self.response_id = _generate_id()
+
+    def chunk_parser(self, chunk: dict) -> ModelResponseStream:
+        """
+        Parse a Snowflake streaming chunk and transform it to OpenAI format.
+
+        Snowflake sends choices[].delta with custom type field for tool_use.
+        """
+        if "choices" in chunk:
+            return self._handle_snowflake_chunk(chunk)
+
+        # Fallback for any other format
+        return ModelResponseStream(
+            id=chunk.get("id", self.response_id),
+            object="chat.completion.chunk",
+            choices=[],
+        )
+
+    def _handle_snowflake_chunk(self, chunk: dict) -> ModelResponseStream:
+        """
+        Handle Snowflake streaming chunks with choices[].delta format.
+
+        Transforms Snowflake's tool_use deltas to OpenAI's tool_calls format.
+        """
+        choices = chunk.get("choices", [])
+        transformed_choices = []
+
+        for choice in choices:
+            delta = choice.get("delta", {})
+            delta_type = delta.get("type", "")
+
+            text_content: Optional[str] = None
+            tool_call: Optional[ChatCompletionToolCallChunk] = None
+            finish_reason: Optional[str] = choice.get("finish_reason")
+
+            if delta_type == "text":
+                # Text content chunk
+                text_content = delta.get("content", "")
+
+            elif delta_type == "tool_use":
+                # Tool use chunk - could be start (has tool_use_id, name) or continuation (has input)
+                tool_use_id = delta.get("tool_use_id")
+                tool_name = delta.get("name")
+                tool_input = delta.get("input", "")
+
+                if tool_use_id:
+                    # New tool call starting
+                    self.tool_index += 1
+                    self.current_tool_use_id = tool_use_id
+                    tool_call = ChatCompletionToolCallChunk(
+                        id=tool_use_id,
+                        type="function",
+                        function=ChatCompletionToolCallFunctionChunk(
+                            name=tool_name or "",
+                            arguments="",
+                        ),
+                        index=self.tool_index,
+                    )
+                elif tool_input:
+                    # Continuation of tool call with input delta
+                    tool_call = ChatCompletionToolCallChunk(
+                        id=None,
+                        type="function",
+                        function=ChatCompletionToolCallFunctionChunk(
+                            name=None,
+                            arguments=tool_input,
+                        ),
+                        index=self.tool_index,
+                    )
+
+            transformed_choices.append(
+                StreamingChoices(
+                    index=choice.get("index", 0),
+                    delta=Delta(
+                        content=text_content,
+                        tool_calls=[tool_call] if tool_call else None,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            )
+
+        # Extract usage if present
+        usage: Optional[Usage] = None
+        if "usage" in chunk:
+            usage_data = chunk["usage"]
+            if usage_data:
+                usage = Usage(
+                    prompt_tokens=usage_data.get("prompt_tokens", 0),
+                    completion_tokens=usage_data.get("completion_tokens", 0),
+                    total_tokens=usage_data.get("total_tokens", 0),
+                )
+
+        return ModelResponseStream(
+            id=chunk.get("id", self.response_id),
+            object="chat.completion.chunk",
+            created=chunk.get("created"),
+            model=chunk.get("model"),
+            choices=transformed_choices,
+            usage=usage,
+        )
+
